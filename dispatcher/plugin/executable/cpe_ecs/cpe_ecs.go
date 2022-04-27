@@ -59,6 +59,7 @@ type Args struct {
 
 	Cpe_ecs_ip_table []string `yaml:"cpe_ecs_ip_table"`
 	Duration         uint     `yaml:"duration"` // (milliseconds) duration for refresh.
+	UrlTag           string   `yaml:"urltag"`
 }
 
 type cpe_ecsPlugin struct {
@@ -71,6 +72,7 @@ type cpe_ecsPlugin struct {
 type cpe_ecs_ip struct {
 	cpeip      netlist.IPv6
 	ecsip      netlist.IPv6
+	UrlTag     string
 	storedTime time.Time
 	v6         bool
 }
@@ -96,7 +98,7 @@ func newPlugin(bp *handler.BP, args *Args) (p *cpe_ecsPlugin, err error) {
 	ep.args = args
 	ep.d = time.Duration(args.Duration) * time.Millisecond
 	if len(args.Cpe_ecs_ip_table) != 0 {
-		err := BatchLoad(&ep.cpe_ecs_ip_table, args.Cpe_ecs_ip_table)
+		err := BatchLoad(&ep.cpe_ecs_ip_table, args.Cpe_ecs_ip_table, args.UrlTag)
 		if err != nil {
 			return nil, err
 		}
