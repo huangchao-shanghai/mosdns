@@ -1,66 +1,226 @@
+//     Copyright (C) 2020-2021, IrineSistiana
+//
+//     This file is part of mosdns.
+//
+//     mosdns is free software: you can redistribute it and/or modify
+//     it under the terms of the GNU General Public License as published by
+//     the Free Software Foundation, either version 3 of the License, or
+//     (at your option) any later version.
+//
+//     mosdns is distributed in the hope that it will be useful,
+//     but WITHOUT ANY WARRANTY; without even the implied warranty of
+//     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//     GNU General Public License for more details.
+//
+//     You should have received a copy of the GNU General Public License
+//     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 package cpe_ecs
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v3/dispatcher/handler"
-	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/dnsutils"
+	"github.com/IrineSistiana/mosdns/v3/dispatcher/pkg/matcher/netlist"
+	"github.com/miekg/dns"
+	"go.uber.org/zap"
 )
 
 const PluginType = "cpe_ecs"
 
 func init() {
-	// Register this plugin type with its initialization funcs. So that, this plugin
-	// can be configured by user from configuration file.
 	handler.RegInitFunc(PluginType, Init, func() interface{} { return new(Args) })
 
-	// You can also register a plugin object directly. (If plugin do not need to configure)
-	// Then you can directly use "_sleep_500ms" in configuration file.
-	handler.MustRegPlugin(&cpe_ecs{
-		BP: handler.NewBP("_cpe_ecs", PluginType),
-		d:  time.Millisecond * 500,
-	})
+	handler.MustRegPlugin(&noECS{BP: handler.NewBP("_no_cpe_ecs", PluginType)})
 }
 
-// Args is the arguments of plugin. It will be decoded from yaml.
-// So it is recommended to use `yaml` as struct field's tag.
+var _ handler.ExecutablePlugin = (*cpe_ecsPlugin)(nil)
+
 type Args struct {
-	Duration uint `yaml:"duration"` // (milliseconds) duration for sleep.
+	// Automatically append client address as ecs.
+	// If this is true, pre-set addresses will not be used.
+	Auto bool `yaml:"auto"`
+
+	// force overwrite existing ecs
+	ForceOverwrite bool `yaml:"force_overwrite"`
+
+	// mask for ecs
+	Mask4 uint8 `yaml:"mask4"` // default 24
+	Mask6 uint8 `yaml:"mask6"` // default 48
+
+	// pre-set address
+	IPv4 string `yaml:"ipv4"`
+	IPv6 string `yaml:"ipv6"`
+
+	Cpe_ecs_ip_table []string `yaml:"cpe_ecs_ip_table"`
+	Duration         uint     `yaml:"duration"` // (milliseconds) duration for refresh.
 }
 
-var _ handler.ExecutablePlugin = (*cpe_ecs)(nil)
-
-// cpe_ecs implements handler.ExecutablePlugin.
-type cpe_ecs struct {
+type cpe_ecsPlugin struct {
 	*handler.BP
-	d time.Duration
+	args             *Args
+	cpe_ecs_ip_table sync.Map
+	d                time.Duration
 }
 
-// Exec implements handler.Executable.
-func (s *cpe_ecs) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
-	if s.d > 0 {
-		timer := pool.GetTimer(s.d)
-		defer pool.ReleaseTimer(timer)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			return ctx.Err()
+type cpe_ecs_ip struct {
+	cpeip      netlist.IPv6
+	ecsip      netlist.IPv6
+	storedTime time.Time
+	v6         bool
+}
+
+func Init(bp *handler.BP, args interface{}) (p handler.Plugin, err error) {
+	return newPlugin(bp, args.(*Args))
+}
+
+func newPlugin(bp *handler.BP, args *Args) (p *cpe_ecsPlugin, err error) {
+	if args.Mask4 <= 0 || args.Mask4 > 32 {
+		args.Mask4 = 24
+	}
+	if args.Mask6 <= 0 || args.Mask6 > 128 {
+		args.Mask6 = 48
+	}
+	//default 600 second
+	if args.Duration == 0 {
+		args.Duration = 600
+	}
+
+	ep := new(cpe_ecsPlugin)
+	ep.BP = bp
+	ep.args = args
+	ep.d = time.Duration(args.Duration) * time.Millisecond
+	if len(args.Cpe_ecs_ip_table) != 0 {
+		err := BatchLoad(&ep.cpe_ecs_ip_table, args.Cpe_ecs_ip_table)
+		if err != nil {
+			return nil, err
+		}
+		//处理表格
+	} else {
+		return nil, fmt.Errorf("invaild cpe ecs ip table %s", args.Cpe_ecs_ip_table)
+	}
+
+	return ep, nil
+}
+
+// Exec tries to append ECS to qCtx.Q().
+// If an error occurred, Exec will just log it to internal logger.
+// It will never raise its own error.
+func (e *cpe_ecsPlugin) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
+	upgraded, newECS, err := e.addECS(qCtx)
+	if err != nil {
+		e.L().Warn("internal err", zap.Error(err))
+	}
+
+	err = handler.ExecChainNode(ctx, qCtx, next)
+	if err != nil {
+		return err
+	}
+
+	if r := qCtx.R(); r != nil {
+		if upgraded {
+			dnsutils.RemoveEDNS0(r)
+		} else {
+			if newECS {
+				dnsutils.RemoveMsgECS(r)
+			}
+		}
+	}
+	return nil
+}
+
+var (
+	errNoClientAddr = errors.New("context doesn't have a client ip")
+)
+
+// addECS adds *dns.EDNS0_SUBNET record to q.
+// The clientAddr can be nil.
+// First returned bool: Whether the addECS upgraded the q to a EDNS0 enabled query.
+// Second returned bool: Whether the addECS added a *dns.EDNS0_SUBNET to q that didn't
+// have a *dns.EDNS0_SUBNET before.
+func (e *cpe_ecsPlugin) addECS(qCtx *handler.Context) (upgraded bool, newECS bool, err error) {
+	q := qCtx.Q()
+
+	clientIP := qCtx.ReqMeta().ClientIP // Maybe nil.
+
+	opt := q.IsEdns0()
+	hasECS := opt != nil && dnsutils.GetECS(opt) != nil
+	if hasECS && !e.args.ForceOverwrite {
+		// Argument args.ForceOverwrite is disabled. q already has an edns0 subnet. Skip it.
+		return false, false, nil
+	}
+
+	var ecs *dns.EDNS0_SUBNET
+	if e.args.Auto { // use client ip
+		if clientIP == nil {
+			return false, false, errNoClientAddr
+		}
+		if ip4 := clientIP.To4(); ip4 != nil { // is ipv4
+			ecs = dnsutils.NewEDNS0Subnet(ip4, e.args.Mask4, false)
+		} else {
+			if ip6 := clientIP.To16(); ip6 != nil { // is ipv6
+				ecs = dnsutils.NewEDNS0Subnet(ip6, e.args.Mask6, true)
+			} else { // non
+				return false, false, fmt.Errorf("invalid client ip address [%s]", clientIP)
+			}
+		}
+	} else { // use preset ip
+		cip, err := netlist.Conv(clientIP)
+		if err != nil {
+			return false, false, fmt.Errorf("invalid client ip address [%s]", clientIP)
+		}
+		//取出 sync.Map 中 cpe ip 对应的 ecs ip
+		t, ok := e.cpe_ecs_ip_table.Load(cip)
+		if ok {
+			ecsip := t.(*cpe_ecs_ip).ecsip.ToNetIP()
+			if ecsip != nil {
+				if t.(*cpe_ecs_ip).v6 {
+					//ipv6
+					ecs = dnsutils.NewEDNS0Subnet(ecsip, e.args.Mask6, true)
+				} else {
+					//ipv4
+					ecs = dnsutils.NewEDNS0Subnet(ecsip, e.args.Mask4, false)
+				}
+			}
 		}
 	}
 
-	// Call handler.ExecChainNode() can execute next plugin.
-	return handler.ExecChainNode(ctx, qCtx, next)
-
-	// You can control how/when to execute next plugin.
-	// For more complex example, see plugin "cache".
+	if ecs != nil {
+		if opt == nil {
+			upgraded = true
+			opt = dnsutils.UpgradeEDNS0(q)
+		}
+		newECS = dnsutils.AddECS(opt, ecs, true)
+		return upgraded, newECS, nil
+	}
+	return false, false, nil
 }
 
-// Init is a handler.NewPluginFunc.
-func Init(bp *handler.BP, args interface{}) (p handler.Plugin, err error) {
-	d := args.(*Args).Duration
-	return &cpe_ecs{
-		BP: bp,
-		d:  time.Duration(d) * time.Millisecond,
-	}, nil
+/* func checkQueryType(m *dns.Msg, typ uint16) bool {
+	if len(m.Question) > 0 && m.Question[0].Qtype == typ {
+		return true
+	}
+	return false
+}
+*/
+type noECS struct {
+	*handler.BP
+}
+
+var _ handler.ExecutablePlugin = (*noECS)(nil)
+
+func (n *noECS) Exec(ctx context.Context, qCtx *handler.Context, next handler.ExecutableChainNode) error {
+	dnsutils.RemoveMsgECS(qCtx.Q())
+	if err := handler.ExecChainNode(ctx, qCtx, next); err != nil {
+		return err
+	}
+	if qCtx.R() != nil {
+		dnsutils.RemoveMsgECS(qCtx.R())
+	}
+	return nil
 }
